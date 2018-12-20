@@ -6,6 +6,7 @@ python -m retro.import <Path to Roms>
 """
 
 import tensorflow as tf
+#from tensorflow.python import debug as tf_debug
 import numpy as np
 import random
 import retro
@@ -17,6 +18,7 @@ from skimage.color import rgb2gray
 import matplotlib.pyplot as plt
 
 from collections import deque
+from collections import namedtuple
 
 # ignore some warnings from skimage
 import warnings
@@ -45,7 +47,7 @@ MEMORY_SIZE = 1000000
 
 def main():
     env = retro.make('SpaceInvaders-Atari2600')
-    print(f'The size of our frame is: {env.observation_space}')
+    print(f'The size of our frame is: {env.observation_space.shape}')
     print(f'The number of actions: {env.action_space.n}')
 
     # Create a one-hot encoded version of our actions
@@ -58,36 +60,44 @@ def main():
     state = env.reset()
     state, stacked_frames = stack_frames(stacked_frames, state, True) # is new episode
 
-    # Reset the computation graph
-    tf.reset_default_graph()
+    
 
     # Initialize DQN and memory replay buffer
-    dqn = DQN(state.shape, env.action_space.n)
+    
     memory_buffer = MemoryBuffer(max_size=MEMORY_SIZE)
+
+    # Pretrain/Prefill the memory buffer
     for _ in range(NUM_PRETRAIN_STEPS):
         # Take a random action
         random_action_index = random.randint(0, len(one_hot_actions) - 1)
         random_action = one_hot_actions[random_action_index]
-        next_state, reward, is_done, _ = env.step(random_action)
+        next_state, reward, done, _ = env.step(random_action)
+        env.render()
 
         next_state, stacked_frames = stack_frames(stacked_frames, next_state, False) # is not new episode
 
         # If the episode is finished (we are dead 3x)
-        if is_done:
+        if done:
             # Zero out the next state
             next_state = np.zeros(state.shape)
 
             # Add the experience to memory
-            memory_buffer.add((state, random_action, reward, next_state, is_done))
+            memory_buffer.add(Experience(state, random_action, reward, next_state, done))
 
             # Reset for the start of a new episode
             state = env.reset()
             state, stacked_frames = stack_frames(stacked_frames, state, True) # is new episode
         else:
-            memory_buffer.add((state, random_action, reward, next_state, is_done))
+            memory_buffer.add(Experience(state, random_action, reward, next_state, done))
             state = next_state
 
-    writer = tf.summary.FileWriter('/tensorboard/dqn/1')
+    # Reset the computation graph (just in case)
+    tf.reset_default_graph()
+    # TODO: do these names really need to match e.g. DQN to DQN
+    dqn = DQN(state.shape, env.action_space.n)
+
+    # Set up logging and Saving
+    writer = tf.summary.FileWriter('./tensorboard/DQN/1')
     tf.summary.scalar('Loss', dqn.loss)
     write_op = tf.summary.merge_all()
     saver = tf.train.Saver()
@@ -104,13 +114,11 @@ def main():
             for step_index in range(MAX_NUM_STEPS):
                 # Pick an action and take it
                 action, explore_probability = select_action(state, one_hot_actions, step_index, dqn, sess)
-                next_state, reward, is_done, _ = env.step(action)
-
+                next_state, reward, done, _ = env.step(action)
                 env.render()
-
                 episode_reward += reward
-
-                if is_done:
+                if done:
+                    # Add a terminal a frame 
                     next_state = np.zeros((110, 84), dtype=int)
                     next_state, stacked_frames(stacked_frames, next_state, False) # is not a new episode
 
@@ -120,34 +128,33 @@ def main():
                     print(f'Training Loss: {loss:.4f}')
 
                     # Store transition/experience in memory <s_t, a_t, r_t+1, s_t+1>
-                    memory_buffer.add((state, action, reward, next_state, is_done))
+                    memory_buffer.add(Experience(state, action, reward, next_state, done))
 
-                    # We are done with this episode
+                    # We are done with this episode, so exit the loop
                     break
                 else:
                     next_state, stacked_frames = stack_frames(stacked_frames, state, False) # is not a new episode
-                    memory_buffer.add((state, action, reward, next_state, is_done))
+                    memory_buffer.add(Experience(state, action, reward, next_state, done))
                     state = next_state
 
                 ### LEARNING PART
-                # Obtain random mini-batch from memory
+                # Obtain random mini-batch of Experiences from memory
                 batch = memory_buffer.sample(BATCH_SIZE)
-                # TODO clean up this section and fix error where we can't slice on tuple
-                states_mini_batch = batch[0, :]
-                actions_mini_batch = batch[1, :]
-                rewards_mini_batch = batch[2, :]
-                next_states_mini_batch = batch[3, :]
-                dones_mini_batch = batch[4, :]
+                # TODO is there a better way to slice on tuple?
+                # ndmin=3 for states since they are 3D tensors (array of 2D frames)
+                states_mini_batch = np.array([exp.state for exp in batch], ndmin=3)
+                actions_mini_batch = np.array([exp.action for exp in batch])
+                next_states_mini_batch = np.array([exp.next_state for exp in batch], ndmin=3)
 
                 target_q_values_batch = []
 
                 # Get Q values for next state
                 q_values_next_state = sess.run(dqn.output, feed_dict={dqn.inputs: next_states_mini_batch})
-                for experience, experience_index in enumerate(batch):
-                    if experience[4]:
-                        target_q_values_batch.append(experience[2])
+                for experience_index, experience in enumerate(batch):
+                    if experience.done:
+                        target_q_values_batch.append(experience.reward)
                     else:
-                        target = experience[2] + DISCOUNT_RATE*np.max(q_values_next_state[experience_index])
+                        target = experience.reward + DISCOUNT_RATE*np.max(q_values_next_state[experience_index])
                         target_q_values_batch.append(target)
 
                     loss, _ = sess.run(
@@ -168,17 +175,12 @@ def main():
                         }
                     )
                     writer.add_summary(summary, episode_index)
+                    writer.flush()
 
                     # Save model, every 5 episodes
                     if episode_index % 5 == 0:
                         _ = saver.save(sess, "./models/model.ckpt")
-
-
-
-
-
-
-
+    # end training
 
 def create_stacked_frames():
     return deque([np.zeros((110,84), dtype=int) for i in range(FRAME_STACK_SIZE)], maxlen=FRAME_STACK_SIZE)
@@ -218,7 +220,7 @@ def stack_frames(stacked_frames, state, is_new_episode):
     return stacked_state, stacked_frames
 
 def select_action(state, actions, decay_step, dqn, sess):
-    explore_probability = MAX_EXPLORE_PROB + (MAX_EXPLORE_PROB - MIN_EXPLORE_PROB)*np.exp(-EXPLORE_RATE_DECAY*decay_step)
+    explore_probability = MIN_EXPLORE_PROB + (MAX_EXPLORE_PROB - MIN_EXPLORE_PROB)*np.exp(-EXPLORE_RATE_DECAY*decay_step)
     if explore_probability > np.random.rand():
         # Pick a random action
         action = actions[random.randint(0, len(actions) - 1)]
@@ -239,7 +241,7 @@ class DQN(object):
             # We create the placeholders
             # NOTE: *state_size unpacks the tuple
 
-            self.inputs = tf.placeholder(tf.float32, [None, *state_size], name='Inputs')
+            self.inputs = tf.placeholder(tf.float32, [None, *self.state_size], name='inputs')
             self.actions = tf.placeholder(tf.float32, [None, self.action_size], name='actions')
 
             # Remember that target_Q is the R(s,a) + ymax*Qhat(s',a')
@@ -305,6 +307,8 @@ class DQN(object):
             self.loss = tf.reduce_mean(tf.square(self.target_q - self.predicted_q))
             self.optimizer = tf.train.AdamOptimizer(LEARNING_RATE).minimize(self.loss)
 
+Experience = namedtuple('Experience', ['state', 'action', 'reward', 'next_state', 'done'])
+
 class MemoryBuffer(object):
     def __init__(self, max_size):
         self.buffer = deque(maxlen=max_size)
@@ -313,14 +317,8 @@ class MemoryBuffer(object):
         self.buffer.append(experience)
 
     def sample(self, batch_size):
-        buffer_size = len(self.buffer)
         # Take batch_size samples from the buffer
         return random.sample(self.buffer, batch_size)
-        # return np.random.choice(
-        #     self.buffer,
-        #     size=batch_size,
-        #     replace=False
-        # )
 
 if __name__ == "__main__":
     main()
