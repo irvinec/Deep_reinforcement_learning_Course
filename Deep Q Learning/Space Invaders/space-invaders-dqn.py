@@ -21,13 +21,14 @@ from collections import deque
 from collections import namedtuple
 
 # ignore some warnings from skimage
-import warnings
+import warnings # This ignore all the warning messages that are normally printed during the training because of skiimage
+warnings.filterwarnings('ignore')
 
 # Image processing hyperparameters
 FRAME_STACK_SIZE = 4
 
 # Training hyperparameters
-NUM_EPISODES = 50
+NUM_EPISODES = 2
 MAX_NUM_STEPS = 50000
 BATCH_SIZE = 64
 
@@ -60,13 +61,11 @@ def main():
     state = env.reset()
     state, stacked_frames = stack_frames(stacked_frames, state, True) # is new episode
 
-    
-
     # Initialize DQN and memory replay buffer
-    
     memory_buffer = MemoryBuffer(max_size=MEMORY_SIZE)
 
     # Pretrain/Prefill the memory buffer
+    print(f'Starting memory buffer pretraining with {NUM_PRETRAIN_STEPS} steps')
     for _ in range(NUM_PRETRAIN_STEPS):
         # Take a random action
         random_action_index = random.randint(0, len(one_hot_actions) - 1)
@@ -78,6 +77,7 @@ def main():
 
         # If the episode is finished (we are dead 3x)
         if done:
+            print('Pretrain steps reached end state. Reseting the environment.')
             # Zero out the next state
             next_state = np.zeros(state.shape)
 
@@ -91,10 +91,13 @@ def main():
             memory_buffer.add(Experience(state, random_action, reward, next_state, done))
             state = next_state
 
+    print('Pretraining memory buffer finished.')
     # Reset the computation graph (just in case)
     tf.reset_default_graph()
+    print('Creating DQN')
     # TODO: do these names really need to match e.g. DQN to DQN
     dqn = DQN(state.shape, env.action_space.n)
+    print('Finished creating DQN')
 
     # Set up logging and Saving
     writer = tf.summary.FileWriter('./tensorboard/DQN/1')
@@ -103,7 +106,9 @@ def main():
     saver = tf.train.Saver()
 
     # train
-    with tf.Session() as sess:
+    print('Starting training.')
+    # Create session and log if we are using CPU or GPU
+    with tf.Session(config=tf.ConfigProto(log_device_placement=True)) as sess:
         # Initialize the variables
         sess.run(tf.global_variables_initializer())
 
@@ -136,6 +141,7 @@ def main():
                     next_state, stacked_frames = stack_frames(stacked_frames, state, False) # is not a new episode
                     memory_buffer.add(Experience(state, action, reward, next_state, done))
                     state = next_state
+                    print(f'Completed Step {step_index}.')
 
                 ### LEARNING PART
                 # Obtain random mini-batch of Experiences from memory
@@ -181,6 +187,7 @@ def main():
                     if episode_index % 5 == 0:
                         _ = saver.save(sess, "./models/model.ckpt")
     # end training
+    print('Training finished')
 
 def create_stacked_frames():
     return deque([np.zeros((110,84), dtype=int) for i in range(FRAME_STACK_SIZE)], maxlen=FRAME_STACK_SIZE)
