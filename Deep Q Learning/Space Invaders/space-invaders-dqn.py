@@ -5,10 +5,11 @@ extract all the "Roms.rar" files.
 python -m retro.import <Path to Roms>
 """
 
+import argparse
+import random
 import tensorflow as tf
 #from tensorflow.python import debug as tf_debug
 import numpy as np
-import random
 import retro
 
 # For image preprocessing
@@ -188,6 +189,50 @@ def main():
                         _ = saver.save(sess, "./models/model.ckpt")
     # end training
     print('Training finished')
+
+def parse_script_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--learning-rate', type=float, action='store', dest='learning_rate',
+        default=0.00025,
+        help='The learning rate used in training. a.k.a alpha'
+    )
+    parser.add_argument(
+        '--num-episodes', type=int, action='store', dest='num_episodes',
+        default=5000,
+        help="The number of episodes used in training."
+    )
+    parser.add_argument(
+        '--max-num-steps', type=int, action='store', dest='max_num_steps',
+        default=50000,
+        help="The max number of steps to take in an episode."
+    )
+    parser.add_argument(
+        '--batch-size', type=int, action='store', dest='batch_size',
+        default=64,
+        help='The training batch size.'
+    )
+    parser.add_argument(
+        '--max-explore-prob', type=float, action='store', dest='max-explore-prob',
+        default=1.0,
+        help='The max probability that the agent will choose to randomly explore.'
+    )
+    parser.add_argument(
+        '--min-explore-prob', type=float, action='store', dest='min_explore_prob',
+        default='0.01',
+        help='The min probability that the agent will choose to randomly explore.'
+    )
+    parser.add_argument(
+        '--explore-prob-decay-rate', type=float, action='store', dest='explore_prob_decay_rate',
+        default='0.00001',
+        help='The the rate at which the explore probability will decay with each episode. This causes the agent to explore less in later episodes.'
+    )
+    parser.add_argument(
+        '--discount-rate', type=float, action='store', dest='discount_rate',
+        default='0.9',
+        help='The discount rate. a.k.a gamma.'
+    )
+
 
 def create_stacked_frames():
     return deque([np.zeros((110,84), dtype=int) for i in range(FRAME_STACK_SIZE)], maxlen=FRAME_STACK_SIZE)
