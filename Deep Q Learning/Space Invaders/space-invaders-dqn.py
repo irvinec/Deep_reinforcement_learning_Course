@@ -25,29 +25,8 @@ from collections import namedtuple
 import warnings # This ignore all the warning messages that are normally printed during the training because of skiimage
 warnings.filterwarnings('ignore')
 
-# Image processing hyperparameters
-FRAME_STACK_SIZE = 4
-
-# Training hyperparameters
-NUM_EPISODES = 2
-MAX_NUM_STEPS = 50000
-BATCH_SIZE = 64
-
-# Exploration hyperparameters
-MAX_EXPLORE_PROB = 1.0
-MIN_EXPLORE_PROB = 0.1
-EXPLORE_RATE_DECAY = 0.00001    # Exponential decay rate for exploration probability
-
-# Q learning hyperparameter
-DISCOUNT_RATE = 0.9
-LEARNING_RATE = 0.00025     # Alpha (aka learning rate)
-
-# Memory hyperparameters
-NUM_PRETRAIN_STEPS = BATCH_SIZE
-MEMORY_SIZE = 1000000
-
-
 def main():
+    script_args = parse_script_args()
     env = retro.make('SpaceInvaders-Atari2600')
     print(f'The size of our frame is: {env.observation_space.shape}')
     print(f'The number of actions: {env.action_space.n}')
@@ -56,18 +35,19 @@ def main():
     one_hot_actions = np.identity(env.action_space.n, dtype=int)
 
     # Initialize deque with zero-images one array for each image
-    stacked_frames = create_stacked_frames()
+    stacked_frames = create_stacked_frames(script_args.frame_stack_size)
 
     # Setup the first pre-train episode
     state = env.reset()
     state, stacked_frames = stack_frames(stacked_frames, state, True) # is new episode
 
     # Initialize DQN and memory replay buffer
-    memory_buffer = MemoryBuffer(max_size=MEMORY_SIZE)
+    memory_buffer = MemoryBuffer(max_size=script_args.mem_buffer_size)
 
+    # TODO: Refactor into a new function
     # Pretrain/Prefill the memory buffer
-    print(f'Starting memory buffer pretraining with {NUM_PRETRAIN_STEPS} steps')
-    for _ in range(NUM_PRETRAIN_STEPS):
+    print(f'Starting memory buffer pretraining with {script_args.num_pretrain_steps} steps')
+    for _ in range(script_args.num_pretrain_steps):
         # Take a random action
         random_action_index = random.randint(0, len(one_hot_actions) - 1)
         random_action = one_hot_actions[random_action_index]
@@ -76,9 +56,10 @@ def main():
 
         next_state, stacked_frames = stack_frames(stacked_frames, next_state, False) # is not new episode
 
-        # If the episode is finished (we are dead 3x)
+        # If the episode is finished,
+        # we need to reset the environment and keep pre-training
+        # until we reach our step limit.
         if done:
-            print('Pretrain steps reached end state. Reseting the environment.')
             # Zero out the next state
             next_state = np.zeros(state.shape)
 
@@ -95,31 +76,38 @@ def main():
     print('Pretraining memory buffer finished.')
     # Reset the computation graph (just in case)
     tf.reset_default_graph()
-    print('Creating DQN')
-    # TODO: do these names really need to match e.g. DQN to DQN
-    dqn = DQN(state.shape, env.action_space.n)
-    print('Finished creating DQN')
+    dqn = DQN(state.shape, env.action_space.n, script_args.learning_rate)
 
     # Set up logging and Saving
+    # TODO: maybe for now we want to write this to a 
+    # git-ignored folder and then manually copy when we have a good training run.
     writer = tf.summary.FileWriter('./tensorboard/DQN/1')
     tf.summary.scalar('Loss', dqn.loss)
     write_op = tf.summary.merge_all()
     saver = tf.train.Saver()
 
-    # train
+    # Train
     print('Starting training.')
-    # Create session and log if we are using CPU or GPU
-    with tf.Session(config=tf.ConfigProto(log_device_placement=True)) as sess:
-        # Initialize the variables
+    gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.6)
+    with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:
+        # Initialize the tf variables
         sess.run(tf.global_variables_initializer())
 
-        for episode_index in range(NUM_EPISODES):
+        for episode_index in range(script_args.num_episodes):
             episode_reward = 0
             state = env.reset()
             state, stacked_frames = stack_frames(stacked_frames, state, True) # is new episode
-            for step_index in range(MAX_NUM_STEPS):
+            for step_index in range(script_args.max_num_steps):
                 # Pick an action and take it
-                action, explore_probability = select_action(state, one_hot_actions, step_index, dqn, sess)
+                action, explore_probability = select_action(
+                                                state,
+                                                one_hot_actions,
+                                                script_args.min_explore_prob,
+                                                script_args.max_explore_prob,
+                                                script_args.explore_prob_decay_rate,
+                                                step_index,
+                                                dqn,
+                                                sess)
                 next_state, reward, done, _ = env.step(action)
                 env.render()
                 episode_reward += reward
@@ -142,11 +130,10 @@ def main():
                     next_state, stacked_frames = stack_frames(stacked_frames, state, False) # is not a new episode
                     memory_buffer.add(Experience(state, action, reward, next_state, done))
                     state = next_state
-                    print(f'Completed Step {step_index}.')
 
                 ### LEARNING PART
                 # Obtain random mini-batch of Experiences from memory
-                batch = memory_buffer.sample(BATCH_SIZE)
+                batch = memory_buffer.sample(script_args.batch_size)
                 # TODO is there a better way to slice on tuple?
                 # ndmin=3 for states since they are 3D tensors (array of 2D frames)
                 states_mini_batch = np.array([exp.state for exp in batch], ndmin=3)
@@ -161,7 +148,7 @@ def main():
                     if experience.done:
                         target_q_values_batch.append(experience.reward)
                     else:
-                        target = experience.reward + DISCOUNT_RATE*np.max(q_values_next_state[experience_index])
+                        target = experience.reward + script_args.discount_rate*np.max(q_values_next_state[experience_index])
                         target_q_values_batch.append(target)
 
                     loss, _ = sess.run(
@@ -184,11 +171,12 @@ def main():
                     writer.add_summary(summary, episode_index)
                     writer.flush()
 
+                    # TODO: do we need to also save this to a git-ignored folder?
                     # Save model, every 5 episodes
                     if episode_index % 5 == 0:
                         _ = saver.save(sess, "./models/model.ckpt")
     # end training
-    print('Training finished')
+    print('Training finished.')
 
 def parse_script_args():
     parser = argparse.ArgumentParser()
@@ -213,29 +201,45 @@ def parse_script_args():
         help='The training batch size.'
     )
     parser.add_argument(
-        '--max-explore-prob', type=float, action='store', dest='max-explore-prob',
+        '--max-explore-prob', type=float, action='store', dest='max_explore_prob',
         default=1.0,
         help='The max probability that the agent will choose to randomly explore.'
     )
     parser.add_argument(
         '--min-explore-prob', type=float, action='store', dest='min_explore_prob',
-        default='0.01',
+        default=0.01,
         help='The min probability that the agent will choose to randomly explore.'
     )
     parser.add_argument(
         '--explore-prob-decay-rate', type=float, action='store', dest='explore_prob_decay_rate',
-        default='0.00001',
+        default=0.00001,
         help='The the rate at which the explore probability will decay with each episode. This causes the agent to explore less in later episodes.'
     )
     parser.add_argument(
         '--discount-rate', type=float, action='store', dest='discount_rate',
-        default='0.9',
+        default=0.9,
         help='The discount rate. a.k.a gamma.'
     )
+    parser.add_argument(
+        '--num-pretrain-steps', type=float, action='store', dest='num_pretrain_steps',
+        default=64,
+        help='The number of pretrain steps to use to fill memory buffer.'
+    )
+    parser.add_argument(
+        '--mem-buffer-size', type=float, action='store', dest='mem_buffer_size',
+        default=1000000,
+        help='The size of the memory buffer.'
+    )
+    parser.add_argument(
+        '--frame-stack-size', type=float, action='store', dest='frame_stack_size',
+        default=4,
+        help='The number of frames to stack together for processing/training.'
+    )
 
+    return parser.parse_args()
 
-def create_stacked_frames():
-    return deque([np.zeros((110,84), dtype=int) for i in range(FRAME_STACK_SIZE)], maxlen=FRAME_STACK_SIZE)
+def create_stacked_frames(frame_stack_size):
+    return deque([np.zeros((110,84), dtype=int) for i in range(frame_stack_size)], maxlen=frame_stack_size)
 
 def preprocess_frame(frame):
     # Greyscale frame
@@ -261,9 +265,9 @@ def stack_frames(stacked_frames, state, is_new_episode):
         # Clear our stacked_frames
         # TODO: make this take in an optional param to fill
         # the frames.
-        stacked_frames = create_stacked_frames()
+        stacked_frames = create_stacked_frames(stacked_frames.maxlen)
         # Replicate the first frame to fill the stacked frames
-        stacked_frames.extend([frame]*FRAME_STACK_SIZE)
+        stacked_frames.extend([frame]*stacked_frames.maxlen)
     else:
         # Append the frame to the deque, automatically removes the oldest frame.
         stacked_frames.append(frame)
@@ -271,8 +275,16 @@ def stack_frames(stacked_frames, state, is_new_episode):
     stacked_state = np.stack(stacked_frames, axis=2)
     return stacked_state, stacked_frames
 
-def select_action(state, actions, decay_step, dqn, sess):
-    explore_probability = MIN_EXPLORE_PROB + (MAX_EXPLORE_PROB - MIN_EXPLORE_PROB)*np.exp(-EXPLORE_RATE_DECAY*decay_step)
+def select_action(
+        state,
+        actions,
+        min_explore_prob,
+        max_explore_prob,
+        explore_decay_rate,
+        decay_step,
+        dqn,
+        sess):
+    explore_probability = min_explore_prob + (max_explore_prob - min_explore_prob)*np.exp(-explore_decay_rate*decay_step)
     if explore_probability > np.random.rand():
         # Pick a random action
         action = actions[random.randint(0, len(actions) - 1)]
@@ -285,7 +297,7 @@ def select_action(state, actions, decay_step, dqn, sess):
     return action, explore_probability
 
 class DQN(object):
-    def __init__(self, state_size, action_size):
+    def __init__(self, state_size, action_size, learning_rate):
         self.state_size = state_size
         self.action_size = action_size
 
@@ -357,7 +369,7 @@ class DQN(object):
             self.predicted_q = tf.reduce_sum(tf.multiply(self.output, self.actions))
             # The loss is the sum of (target_q - predicted_q)^2
             self.loss = tf.reduce_mean(tf.square(self.target_q - self.predicted_q))
-            self.optimizer = tf.train.AdamOptimizer(LEARNING_RATE).minimize(self.loss)
+            self.optimizer = tf.train.AdamOptimizer(learning_rate).minimize(self.loss)
 
 Experience = namedtuple('Experience', ['state', 'action', 'reward', 'next_state', 'done'])
 

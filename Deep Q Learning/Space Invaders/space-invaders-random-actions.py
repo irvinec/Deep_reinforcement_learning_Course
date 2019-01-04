@@ -7,8 +7,8 @@ import numpy as np
 import random
 import retro
 
-#import warnings # This ignore all the warning messages that are normally printed during the training because of skiimage
-#warnings.filterwarnings('ignore')
+import warnings # This ignore all the warning messages that are normally printed during the training because of skiimage
+warnings.filterwarnings('ignore')
 
 NUM_EPISODES = 2
 MAX_NUM_STEPS = 50000
